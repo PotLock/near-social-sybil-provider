@@ -1,34 +1,111 @@
 use near_sdk::borsh::{BorshDeserialize, BorshSerialize};
-use near_sdk::collections::LookupMap;
+use near_sdk::collections::{LookupMap, UnorderedMap, UnorderedSet};
+use near_sdk::serde::Serialize;
 use near_sdk::serde_json;
 use near_sdk::{
-    env, near_bindgen, AccountId, BorshStorageKey, Gas, NearToken, PanicOnDefault, Promise,
-    PromiseError,
+    env, log, near_bindgen, require, AccountId, BorshStorageKey, Gas, NearToken, PanicOnDefault,
+    Promise, PromiseError,
 };
 use serde_json::{json, Value as JsonValue};
+
+pub mod constants;
+pub mod utils;
+pub use crate::constants::*;
+pub use crate::utils::*;
+
+pub type TimestampMs = u64;
 
 #[near_bindgen]
 #[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
 #[borsh(crate = "near_sdk::borsh")]
-pub struct ProviderContract {
-    owner_id: AccountId,
+pub struct Contract {
+    owner: AccountId,
+    verified_complete_profiles: UnorderedMap<AccountId, TimestampMs>,
+}
+
+#[derive(BorshSerialize, BorshStorageKey)]
+#[borsh(crate = "near_sdk::borsh")]
+pub enum StorageKey {
+    VerifiedCompleteProfiles,
+}
+
+#[derive(BorshDeserialize, BorshSerialize, BorshStorageKey, Serialize)]
+#[serde(crate = "near_sdk::serde")]
+#[borsh(crate = "near_sdk::borsh")]
+pub enum CheckType {
+    CompleteSocialProfile,
+}
+
+#[derive(BorshDeserialize, BorshSerialize, PanicOnDefault, Serialize)]
+#[serde(crate = "near_sdk::serde")]
+#[borsh(crate = "near_sdk::borsh")]
+pub struct CheckExternal {
+    account_id: AccountId,
+    check_type: CheckType,
+    verified_at: TimestampMs,
 }
 
 #[near_bindgen]
-impl ProviderContract {
+impl Contract {
     #[init]
-    pub fn new() -> Self {
-        assert!(!env::state_exists(), "The contract is already initialized");
+    pub fn new(owner: Option<AccountId>) -> Self {
         Self {
-            owner_id: env::signer_account_id(),
+            owner: owner.unwrap_or(env::signer_account_id()),
+            verified_complete_profiles: UnorderedMap::new(StorageKey::VerifiedCompleteProfiles),
         }
     }
 
-    pub fn check_profile(&self, account_id: AccountId) -> Promise {
+    pub fn has_complete_social_profile_check(&self, account_id: AccountId) -> bool {
+        self.verified_complete_profiles.get(&account_id).is_some()
+    }
+
+    pub fn fetch_complete_social_profile_check(
+        &self,
+        account_id: AccountId,
+    ) -> Option<CheckExternal> {
+        self.verified_complete_profiles
+            .get(&account_id)
+            .map(|verified_at| CheckExternal {
+                account_id,
+                check_type: CheckType::CompleteSocialProfile,
+                verified_at,
+            })
+    }
+
+    pub fn remove_complete_social_profile_check(&mut self) {
+        let account_id = env::predecessor_account_id();
+        // update state
+        if let Some(_verified_at) = self.verified_complete_profiles.remove(&account_id) {
+            log!(format!(
+                "Removing complete social profile check for '{}'",
+                account_id
+            ));
+            // refund user for freed storage
+            let initial_storage_usage = env::storage_usage();
+            let storage_freed = initial_storage_usage - env::storage_usage();
+            log!(format!("Storage freed: {} bytes", storage_freed));
+            let cost_freed = env::storage_byte_cost()
+                .checked_mul(storage_freed as u128)
+                .unwrap();
+            log!(format!("Cost freed: {} yoctoNEAR", cost_freed));
+            if cost_freed.gt(&NearToken::from_near(0)) {
+                log!(format!(
+                    "Refunding {} yoctoNEAR to {}",
+                    cost_freed, account_id
+                ));
+                Promise::new(account_id.clone()).transfer(cost_freed);
+            }
+        }
+    }
+
+    #[payable]
+    pub fn verify_social_profile_completeness(&mut self) -> Promise {
+        let account_id = env::predecessor_account_id();
+        let attached_deposit = env::attached_deposit();
         let social_db: AccountId = if env::signer_account_id().to_string().ends_with(".near") {
-            "social.near"
+            NEAR_SOCIAL_CONTRACT_ADDRESS_MAINNET.to_string()
         } else {
-            "v1.social08.testnet"
+            NEAR_SOCIAL_CONTRACT_ADDRESS_TESTNET.to_string()
         }
         .parse()
         .unwrap();
@@ -45,14 +122,18 @@ impl ProviderContract {
             .then(
                 Self::ext(env::current_account_id())
                     //.with_static_gas(env::prepaid_gas().saturating_div(3))
-                    .on_check_profile(account_id.clone()),
+                    .verify_social_profile_completeness_callback(
+                        account_id.clone(),
+                        attached_deposit,
+                    ),
             )
     }
 
     #[private]
-    pub fn on_check_profile(
-        &self,
+    pub fn verify_social_profile_completeness_callback(
+        &mut self,
         account_id: AccountId,
+        attached_deposit: NearToken,
         #[callback_result] call_result: Result<JsonValue, PromiseError>,
     ) -> bool {
         match call_result {
@@ -103,13 +184,46 @@ impl ProviderContract {
                         .and_then(|t| t.as_object())
                         .map_or(false, |tags| !tags.is_empty());
 
+                    log!(
+                        "Profile check for '{}': name={}, description={}, profile_image={}, background_image={}, linktree={}, tags={}",
+                        account_id,
+                        has_name,
+                        has_description,
+                        has_valid_profile_image,
+                        has_valid_background_image,
+                        has_linktree,
+                        has_tags);
+
                     // Return true if all checks pass
-                    has_name
+                    let is_complete = has_name
                         && has_description
                         && has_valid_profile_image
                         && has_valid_background_image
                         && has_linktree
-                        && has_tags
+                        && has_tags;
+
+                    if is_complete {
+                        let initial_storage_usage = env::storage_usage();
+                        // insert record
+                        self.verified_complete_profiles
+                            .insert(&account_id, &env::block_timestamp_ms());
+                        // calculate storage cost
+                        let required_deposit =
+                            calculate_required_storage_deposit(initial_storage_usage);
+                        // refund any unused deposit, or panic if not enough deposit attached
+                        if attached_deposit.gt(&required_deposit) {
+                            Promise::new(account_id.clone())
+                                .transfer(attached_deposit.checked_sub(required_deposit).unwrap());
+                        } else if attached_deposit.lt(&required_deposit) {
+                            env::panic_str(&format!(
+                                "Must attach {} yoctoNEAR to cover storage",
+                                required_deposit
+                            ));
+                        }
+                        true
+                    } else {
+                        false
+                    }
                 } else {
                     false
                 }
