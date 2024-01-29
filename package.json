@@ -1,0 +1,17 @@
+{
+  "name": "near-social-sybil-provider",
+  "version": "1.0.0",
+  "description": "Sybil Provider that utilizes NEAR Social profile for humanity checks",
+  "main": "index.js",
+  "repository": "git@github.com:PotLock/near-social-sybil-provider.git",
+  "author": "Lachlan Glen <54282009+lachlanglen@users.noreply.github.com>",
+  "license": "MIT",
+  "scripts": {
+    "build": "./scripts/build.sh",
+    "dev:deploy": "./scripts/deploy.sh",
+    "dev:deploy:refresh": "rm -rf neardev && yarn dev:deploy"
+  },
+  "devDependencies": {
+    "near-cli": "^3.4.2"
+  }
+}
