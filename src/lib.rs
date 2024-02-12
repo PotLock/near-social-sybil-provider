@@ -55,7 +55,7 @@ impl Contract {
         }
     }
 
-    pub fn has_complete_social_profile_check(&self, account_id: AccountId) -> bool {
+    pub fn has_complete_profile_check(&self, account_id: AccountId) -> bool {
         self.verified_complete_profiles.get(&account_id).is_some()
     }
 
